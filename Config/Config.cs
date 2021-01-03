@@ -21,9 +21,9 @@ namespace Config
         private static T _Config;
 
         /// <summary>
-        /// Stores whether the configuration is modified.
+        /// Stores the name of the configuration section.
         /// </summary>
-        private static bool _IsDirty = false;
+        private static readonly string _ConfigName = typeof(T).Name;
 
         /// <summary>
         /// Stores wheter the configuration is initialized.
@@ -53,10 +53,12 @@ namespace Config
             else
             {
                 IsAutoSaveEnabled = false;
-                Debug.Print($"CONFIG WARNING: <{typeof(T).Name}> class doesn't implement the INotifyPropertyChanged interface, " +
-                            $"use {nameof(Config<T>)}<{typeof(T).Name}>().{nameof(Save)}() " +
+                Debug.Print($"CONFIG WARNING: <{_ConfigName}> class doesn't implement the INotifyPropertyChanged interface, " +
+                            $"use {nameof(Config<T>)}<{_ConfigName}>().{nameof(Save)}() " +
                             $"to save configuration changes to the App.config.");
             }
+
+            Initialize();
         }
 
         #endregion
@@ -68,6 +70,39 @@ namespace Config
         /// </summary>
         /// <remarks><i>Changes are automatically saved if the configuration type implements the <see cref="INotifyPropertyChanged"/> interface.</i></remarks>
         public static bool IsAutoSaveEnabled { get; private set; }
+
+        /// <summary>
+        /// Gets wheter the configuration has unsaved changes.
+        /// </summary>
+        public static bool IsDirty { get; private set; }
+
+        /// <summary>
+        /// Gets the <see cref="Config{T}"/> associated class from the App.config to get or set a value.
+        /// </summary>
+        /// <returns>The class <see cref="T"/> from the App.config.</returns>
+        public static T Get
+        {
+            get
+            {
+                if (!IsAutoSaveEnabled) IsDirty = true;
+
+                return _Config;
+            }
+        }
+
+        /// <summary>
+        /// Gets the <see cref="Config{T}"/> associated class from the App.config to get or set a value.
+        /// </summary>
+        /// <returns>The class <see cref="T"/> from the App.config.</returns>
+        public static T Set
+        {
+            get
+            {
+                if (!IsAutoSaveEnabled) IsDirty = true;
+
+                return _Config;
+            }
+        }
 
         #endregion
 
@@ -81,7 +116,7 @@ namespace Config
         /// <remarks><i>Only catched if the process exits in a normal way.<br/>If <see cref="IsAutoSaveEnabled"/> is false make sure to call <see cref="Config{T}.Save"/> after changes are made.</i></remarks>
         private static void CurrentDomainProcessExit(object sender, EventArgs e)
         {
-            if (IsAutoSaveEnabled == false && _IsDirty == true)
+            if (IsAutoSaveEnabled == false && IsDirty == true)
                 Save();
         }
 
@@ -90,31 +125,26 @@ namespace Config
         /// </summary>
         /// <param name="sender">The <see cref="object"/> that raised the event.</param>
         /// <param name="e">A <see cref="PropertyChangedEventArgs"/> containing event data.</param>
+        /// <remarks><i></i></remarks>
         private static void PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
             if (!_IsInitialized)
                 return;
 
-            var config = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
-            var configSection = (ConfigSection)config.GetSection(typeof(T).Name);
+            PropertyInfo property = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.Name == e.PropertyName).FirstOrDefault();
 
-            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+            if (property.GetValue(_Config) == null)
+                property.SetValue(_Config, string.Empty);
 
-            foreach (var property in properties)
-            {
-                if (property.Name == e.PropertyName)
-                {
-                    if (property.GetValue(_Config) == null)
-                        ((ConfigElement)configSection.Settings[e.PropertyName]).Value = string.Empty;
-                    else
-                        ((ConfigElement)configSection.Settings[property.Name]).Value = property.GetValue(_Config).ToString();
+            Configuration configuration = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+            ConfigSection configSection = (ConfigSection)configuration.GetSection(_ConfigName);
 
-                    config.Save(ConfigurationSaveMode.Modified);
-                    ConfigurationManager.RefreshSection(typeof(T).Name);
+            configSection.Settings[property.Name] = new ConfigElement { Key = property.Name, Value = property.GetValue(_Config).ToString() };
+            configuration.Save(ConfigurationSaveMode.Modified);
 
-                    break;
-                }
-            }
+            ConfigurationManager.RefreshSection(_ConfigName);
+
+            Debug.Print($"CONFIG INFO: Property <{property.Name}> is saved.");
         }
 
         #endregion
@@ -122,234 +152,170 @@ namespace Config
         #region Methods
 
         /// <summary>
-        /// Creates a new configuration in the App.config or returns an existing configuration if present.
+        /// Initializes or creates a new <see cref="Config{T}"/> in the App.config.
         /// </summary>
-        /// <returns>The created or existing class of type <see cref="T"/> with default or existing property values.</returns>
-        public static T Create()
+        /// <exception cref="ConfigurationException">When App.config elements don't match <see cref="Config{T}"/>'s type properties.</exception>
+        private static void Initialize()
         {
-            return Get();
+            Configuration configuration = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+
+            // Adds the section to the config sections if doesn't exist
+            if (configuration.Sections[_ConfigName] == null)
+            {
+                configuration.Sections.Add(_ConfigName, new ConfigSection());
+                configuration.Save(ConfigurationSaveMode.Minimal);
+            }
+
+            ConfigSection configSection = (ConfigSection)configuration.GetSection(_ConfigName);
+
+            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+
+            if (configSection.Settings.Count == 0)
+            {
+                Debug.Print($"CONFIG INFO: Configuration for <{typeof(T)}> not found in App.config, new configuration created with default property values.");
+
+                Save();
+            }
+            else if (configSection.Settings.Count != properties.Length)
+            {
+                _IsInitialized = false;
+
+                // Property count doesn't match, the configuration might contain a modified class
+                throw new ConfigurationException($"Invalid <{_ConfigName}> configuration in App.config, number of elements don't match <{_ConfigName}> property count.");
+            }
+            else
+            {
+                // Initialize the internal configuration from the App.config
+                foreach (ConfigElement element in configSection.Settings)
+                {
+                    PropertyInfo property = properties.Where(p => p.Name == element.Key).FirstOrDefault();
+
+                    if (property == null)
+                        throw new ConfigurationException($"Invalid <{_ConfigName}> configuration in App.config, elements don't match <{_ConfigName}> properties.");
+
+                    try
+                    {
+                        // Match the configuration property types
+                        if (property.PropertyType == typeof(string))
+                        {
+                            property.SetValue(_Config, element.Value);
+                        }
+                        else if (property.PropertyType == typeof(int))
+                        {
+                            property.SetValue(_Config, int.Parse(element.Value));
+                        }
+                        else if (property.PropertyType == typeof(float))
+                        {
+                            property.SetValue(_Config, float.Parse(element.Value));
+                        }
+                        else if (property.PropertyType.IsEnum)
+                        {
+                            property.SetValue(_Config, Enum.Parse(property.PropertyType, element.Value));
+                        }
+                        else if (property.PropertyType == typeof(bool))
+                        {
+                            property.SetValue(_Config, Convert.ToBoolean(element.Value));
+                        }
+                        else if (property.PropertyType == typeof(double))
+                        {
+                            property.SetValue(_Config, double.Parse(element.Value));
+                        }
+                        else
+                            // Unsupported property type
+                            throw new ArgumentException($"{nameof(Config<T>)} doesn't support {property.PropertyType}s.", property.Name);
+                    }
+                    catch(Exception)
+                    {
+                        throw new ConfigurationException($"Unable to parse <{element.Value.GetType().Name}> {element.Value} to <{property.PropertyType.Name}>.");
+                    }
+                }
+
+                Debug.Print($"CONFIG INFO: Configuration for <{_ConfigName}> is initialized from the App.config.");
+            }
+
+            _IsInitialized = true;
         }
 
         /// <summary>
-        /// Stores the provided property value into the App.config.
+        /// Sets and saves the provided property.
         /// </summary>
-        /// <param name="key">A <see cref="string"/> specifying the key of the property.</param>
-        /// <param name="value">A <see cref="string"/> specifying the value to store.</param>
-        public static void SetProperty(string key, string value)
+        /// <param name="key">A <see cref="string"/> specifying the property to set.</param>
+        /// <param name="value">An <see cref="object"/> specifying the property value.</param>
+        public static void SetProperty(string key, object value)
         {
-            if (_Config == null)
-            {
-                Debug.Print($"CONFIG ERROR: {nameof(Config<T>)}<{typeof(T).Name}>.{nameof(SetProperty)}() no configuration found.");
-                return;
-            }
-
             if (key == null || key == string.Empty)
             {
-                Debug.Print($"CONFIG ERROR: {nameof(Config<T>)}<{typeof(T).Name}>.{nameof(SetProperty)}() no valid key provided.");
-                return;
+                throw new ConfigurationException($"{nameof(Config<T>)}<{_ConfigName}>.{nameof(Set)}() no valid key provided.");
             }
 
             if (value == null)
                 value = string.Empty;
 
-            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+            PropertyInfo property = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.Name == key).FirstOrDefault();
 
-            //Set the internal configuration property value
-            foreach (var property in properties)
-            {
-                if(property.Name == key)
-                {
-                    property.SetValue(_Config, value);
-                    PropertyChanged(null, new PropertyChangedEventArgs(key));
-                    return;
-                }
-            }
+            if (property == null)
+                throw new ConfigurationException($"{nameof(Config<T>)}<{_ConfigName}>.{nameof(Set)}() key not found.");
 
-            Debug.Print($"CONFIG ERROR: {nameof(Config<T>)}<{typeof(T).Name}>.{nameof(SetProperty)}() {nameof(key)} \"{key}\" not found.");
+            if (property.PropertyType != value.GetType())
+                throw new ConfigurationException($"Type mismatch, provided {nameof(value)} for {key} has to be of type {property.PropertyType.Name}.");
+            
+            // Set the internal configuration value
+            property.SetValue(_Config, value);
+
+            // Use the property changed method to save the value to the App.config
+            PropertyChanged(null, new PropertyChangedEventArgs(key));
         }
-        
+
         /// <summary>
-        /// Stores the current configuration into the App.config, if no configuration exist a new configuration is created with default values.<br/>
-        /// If the <paramref name="updateConfig"/> parameter is provided, the provided configuration class will be used to update the App.config.
+        /// Saves the <see cref="Config{T}"/> associated class into the App.config, if <paramref name="config"/> is provided the current class configuration is overwritten.
         /// </summary>
-        /// <param name="updateConfig">A configuration type <see cref="T"/> to overwrite the current or create a new configuration from.</param>
-        /// <returns>The class of type <see cref="T"/> with the updated properties.</returns>
-        public static T Save(T updateConfig = null)
+        /// <param name="config">A class <see cref="T"/> to save..</param>
+        /// <returns>A class <see cref="T"/> with updated properties.</returns>
+        public static T Save(T config = null)
         {
-            // Create a new instance of the configuration class if it doesn't exist
-            if(updateConfig == null)
-            {
-                if (_Config == null)
-                    _Config = new T();
+            if(config != null)
+                _Config = config;
 
-                // Prevents overwriting existing configuration
-                if(!_IsInitialized)
-                    _Config = Get();
-            }
-            else
-            {
-                _Config = updateConfig;
-            }
+            Configuration configuration = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+            ConfigSection configSection = (ConfigSection)configuration.GetSection(_ConfigName);
 
-            var config = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
-
-            // Adds the section to the config sections if doesn't exist
-            if (config.Sections[typeof(T).Name] == null)
-            {
-                config.Sections.Add(typeof(T).Name, new ConfigSection());
-            }
-
-            var configSection = (ConfigSection)config.GetSection(typeof(T).Name);
-
-            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
 
             foreach (var property in properties)
             {
                 if (property.GetValue(_Config) == null)
                     property.SetValue(_Config, string.Empty);
 
-                if (configSection.Settings[property.Name] == null)
-                {
-                    configSection.Settings[property.Name] = new ConfigElement { Key = property.Name, Value = property.GetValue(_Config).ToString() };
-                }
-                else
-                {
-                    ((ConfigElement)configSection.Settings[property.Name]).Value = property.GetValue(_Config).ToString();
-                }
+                configSection.Settings[property.Name] = new ConfigElement { Key = property.Name, Value = property.GetValue(_Config).ToString() };
             }
 
-            config.Save();
-            ConfigurationManager.RefreshSection(typeof(T).Name);
+            configuration.Save();
+            ConfigurationManager.RefreshSection(_ConfigName);
 
-            _IsDirty = false;
+            IsDirty = false;
 
-            Debug.Print($"CONFIG INFO: The <{typeof(T).Name}> configuration is saved.");
+            Debug.Print($"CONFIG INFO: Configuration for <{_ConfigName}> is saved.");
 
             return _Config;
         }
-
+       
         /// <summary>
-        /// Gets the configuration from the App.config or creates a new configuration in the App.config with default values if no configuration is found.
-        /// </summary>
-        /// <param name="configuration">A <see cref="T"/> to store the configuration.</param>
-        /// <returns>A class of type <see cref="T"/> initialized with the properties from the App.config.</returns>
-        public static T Get()
-        {
-            if (_IsInitialized)
-                return _Config;
-
-            var config = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
-            var configSection = (ConfigSection)config.GetSection(typeof(T).Name);
-
-            if (!IsAutoSaveEnabled)
-                _IsDirty = true;
-
-            if (_Config == null)
-            {
-                _Config = new T();
-                _IsInitialized = false;
-            }
-
-            if (configSection != null)
-            {
-                PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-
-                if (configSection.Settings.Count == 0)
-                {
-                    Debug.Print($"CONFIG INFO: No configuration found for <{typeof(T)}> in App.config, configuration created with default property values.");
-
-                    // The section is empty, save the configuration
-                    Save(_Config);
-                }
-                else if (configSection.Settings.Count != properties.Length)
-                {
-                    // Property count doesn't match, the configuration might contain a modified class
-                    throw new ArgumentOutOfRangeException($"Invalide <{typeof(T).Name}> in App.config, element count doesn't match the number of properties.");
-                }
-                else
-                {
-                    // Initialize the provide configuration class properties with the property values from the App.config
-                    foreach (ConfigElement element in configSection.Settings)
-                    {
-                        PropertyInfo property = properties.Where(p => p.Name == element.Key).First();
-
-                        if (property != null)
-                        {
-                            if (property.PropertyType == typeof(string))
-                            {
-                                property.SetValue(_Config, element.Value);
-                            }
-                            else if (property.PropertyType == typeof(int))
-                            {
-                                property.SetValue(_Config, int.Parse(element.Value));
-                            }
-                            else if (property.PropertyType == typeof(float))
-                            {
-                                property.SetValue(_Config, float.Parse(element.Value));
-                            }
-                            else if (property.PropertyType.IsEnum)
-                            {
-                                property.SetValue(_Config, Enum.Parse(property.PropertyType, element.Value));
-                            }
-                            else if (property.PropertyType == typeof(bool))
-                            {
-                                property.SetValue(_Config, Convert.ToBoolean(element.Value));
-                            }
-                            else if (property.PropertyType == typeof(double))
-                            {
-                                property.SetValue(_Config, double.Parse(element.Value));
-                            }
-                            else
-                                // Unsupported property type
-                                throw new ArgumentException($"{nameof(Config<T>)} doesn't support {property.PropertyType}s.", property.Name);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                Debug.Print($"CONFIG INFO: No configuration found for <{typeof(T)}> in App.config, configuration created with default property values.");
-                
-                config.Sections.Add(typeof(T).Name, new ConfigSection());
-                config.Save();
-
-                ConfigurationManager.RefreshSection(typeof(T).Name);
-
-                Save(_Config);
-            }
-
-            _IsInitialized = true;
-            
-            return _Config;
-        }
-
-        /// <summary>
-        /// Prints the current in memory configuration to the <see cref="Console"/>.
+        /// Prints the current configuration to the <see cref="Console"/>.
         /// </summary>
         public static void Print()
         {
-            if (_Config == null)
-            {
-                Debug.Print($"CONFIG WARNING: No configuration to print.");
-                return;
-            }
+            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
 
-            PropertyInfo[] properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-
-            Console.WriteLine($"<{_Config.GetType().Name}>");
-            Console.WriteLine($"  <Properties>");
+            Console.WriteLine($"<{_ConfigName} AutoSaveEnabled=\"{IsAutoSaveEnabled}\" IsDirty=\"{IsDirty}\">");
+            Console.WriteLine($"  <Settings>");
 
             foreach (var property in properties)
             {
-                if (property.GetValue(_Config) != null)
-                    Console.WriteLine($"    <Add Key=\"{property.Name}\" Value=\"{property.GetValue(_Config).ToString()}\"/>");
-                else
-                    Console.WriteLine($"    <Add Key=\"{property.Name}\" Value=\"\"/>");
+                Console.WriteLine($"    <Add Key=\"{property.Name}\" Value=\"{property.GetValue(_Config)}\"/>");
             }
 
-            Console.WriteLine($"  </Properties>");
-            Console.WriteLine($"</{_Config.GetType().Name}>");
-
+            Console.WriteLine($"  </Settings>");
+            Console.WriteLine($"</{_ConfigName}>");
         }
 
         #endregion
@@ -370,10 +336,7 @@ namespace Config
         public string Key
         {
             get { return (string)base[nameof(Key)]; }
-            set 
-            { 
-                base[nameof(Key)] = value;
-            }
+            set { base[nameof(Key)] = value; }
         }
 
         /// <summary>
@@ -383,11 +346,7 @@ namespace Config
         public string Value
         {
             get { return (string)base[nameof(Value)]; }
-            set 
-            { 
-                base[nameof(Value)] = value;
-                
-            }
+            set { base[nameof(Value)] = value; }
         }
 
         #endregion
@@ -420,8 +379,6 @@ namespace Config
 
                 // Add the new configuration element
                 BaseAdd(value);
-                ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None).Save();
-
             }
         }
 
@@ -470,38 +427,37 @@ namespace Config
     /// <summary>
     /// Defines the configuration section structure to contain a collection of <see cref="ConfigElement"/>s.
     /// </summary>
-    /// <remarks><i>This will represent the &lt;ClassName&gt; tag in the app config set by the <see cref="Config{T}.Set(T)>"/>.</i></remarks>
+    /// <remarks><i>This will represent the &lt;ClassName&gt; tag in the app config set by the <see cref="Config{T}"/>.</i></remarks>
     internal class ConfigSection : ConfigurationSection
     {
-        #region Cosntants
-
-        /// <summary>
-        /// Defines the name of the section containing the collection of properties.
-        /// </summary>
-        private const string SECTION_NAME = "Properties";
-
-        #endregion
-
         #region Properties
 
         /// <summary>
         /// Gets or sets the collection of properties in the app config.
         /// </summary>
-        [ConfigurationProperty(SECTION_NAME)]
+        [ConfigurationProperty(nameof(Settings))]
         [ConfigurationCollection(typeof(ConfigElements))]
         public ConfigElements Settings
         {
             get
             {
-                return (ConfigElements)base[SECTION_NAME];
+                return (ConfigElements)base[nameof(Settings)];
             }
             set
             {
-                base[SECTION_NAME] = value;
+                base[nameof(Settings)] = value;
 
             }
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// Defines a <see cref="Config{T}"/> specific exception.
+    /// </summary>
+    public class ConfigurationException : Exception 
+    {
+        public ConfigurationException(string message) : base(message) { }
     }
 }
